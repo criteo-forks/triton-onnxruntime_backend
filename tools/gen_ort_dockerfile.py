@@ -304,6 +304,13 @@ ENV PYTHONPATH=$INTEL_OPENVINO_DIR/python/python3.12:$INTEL_OPENVINO_DIR/python/
             openvino_toolkit_filename, openvino_folder_name
         )
 
+    if FLAGS.no_root_build:
+        df += """
+RUN useradd --create-home --shell /bin/bash tritonbuild && \\
+    chown -R tritonbuild:tritonbuild /workspace
+USER tritonbuild
+"""
+
     ## TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
     # For ORT versions 1.8.0 and below the behavior will remain same. For ORT version 1.8.1 we will
     # use tensorrt-8.0 branch instead of using rel-1.8.1
@@ -373,7 +380,7 @@ RUN git clone -b rel-${ONNXRUNTIME_VERSION} --recursive ${ONNXRUNTIME_REPO} onnx
             if FLAGS.tensorrt_home is not None:
                 ep_flags += ' --tensorrt_home "{}"'.format(FLAGS.tensorrt_home)
 
-    if os.name == "posix":
+    if os.name == "posix" and not FLAGS.no_root_build:
         if os.getuid() == 0:
             ep_flags += " --allow_running_as_root"
 
@@ -412,6 +419,11 @@ RUN ./build.sh ${{COMMON_BUILD_ARGS}} --update --build {}
 """.format(
         ep_flags
     )
+
+    if FLAGS.no_root_build:
+        df += """
+USER root
+"""
 
     df += """
 #
@@ -575,6 +587,12 @@ if __name__ == "__main__":
         type=str,
         required=False,
         help="CUDA architectures to use for the ONNX Runtime build.",
+    )
+    parser.add_argument(
+        "--no-root-build",
+        action="store_true",
+        required=False,
+        help="Run the ONNX Runtime clone and build steps as a non-root user.",
     )
 
     parser.add_argument(
