@@ -33,6 +33,11 @@ project(tritononnxruntimebackend LANGUAGES C CXX)
 #
 # To build the ONNX Runtime backend you must either:
 #
+#   - Point to an ONNX Runtime artifact produced by Triton's standalone ORT
+#     build step using TRITON_ONNXRUNTIME_ARTIFACTS_PATH.
+#
+#   or:
+#
 #   - Point to an already built ONNX Runtime using
 #     TRITON_ONNXRUNTIME_INCLUDE_PATHS and
 #     TRITON_ONNXRUNTIME_LIB_PATHS
@@ -105,6 +110,8 @@ set(TRITON_ONNXRUNTIME_INCLUDE_PATHS "" CACHE PATH "Paths to ONNXRuntime include
 set(TRITON_ONNX_TENSORRT_REPO_TAG "" CACHE STRING "Tag for onnx-tensorrt repo")
 set(TRT_VERSION "" CACHE STRING "TRT version for this build.")
 set(TRITON_ONNXRUNTIME_LIB_PATHS "" CACHE PATH "Paths to ONNXRuntime libraries")
+set(TRITON_ONNXRUNTIME_ARTIFACTS_PATH "" CACHE PATH
+    "Path to a pre-built ONNXRuntime artifact directory")
 set(TRITON_ONNXRUNTIME_DOCKER_BUILD_NETWORK "" CACHE STRING "Docker network mode for nested ONNXRuntime docker build")
 set(TRITON_ONNXRUNTIME_BUILD_AS_ROOT ON CACHE BOOL "Allow nested ONNXRuntime build to run as root inside the build image")
 
@@ -134,9 +141,29 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(TRITON_ONNXRUNTIME_DOCKER_BUILD OFF)
+set(TRITON_ONNXRUNTIME_INSTALL_PATH "${CMAKE_CURRENT_BINARY_DIR}/onnxruntime")
 # Download onnxruntime
 include(cmake/download_onnxruntime.cmake)
-if(TRITON_ONNXRUNTIME_LIB_PATHS STREQUAL "")
+if(NOT TRITON_ONNXRUNTIME_ARTIFACTS_PATH STREQUAL "")
+  if(NOT IS_DIRECTORY "${TRITON_ONNXRUNTIME_ARTIFACTS_PATH}/include")
+    message(FATAL_ERROR
+      "TRITON_ONNXRUNTIME_ARTIFACTS_PATH must contain an include directory")
+  endif()
+  if(WIN32)
+    set(_TRITON_ONNXRUNTIME_ARTIFACT_LIBRARY
+        "${TRITON_ONNXRUNTIME_ARTIFACTS_PATH}/lib/onnxruntime.lib")
+  else()
+    set(_TRITON_ONNXRUNTIME_ARTIFACT_LIBRARY
+        "${TRITON_ONNXRUNTIME_ARTIFACTS_PATH}/lib/libonnxruntime.so")
+  endif()
+  if(NOT EXISTS "${_TRITON_ONNXRUNTIME_ARTIFACT_LIBRARY}")
+    message(FATAL_ERROR
+      "TRITON_ONNXRUNTIME_ARTIFACTS_PATH does not contain ${_TRITON_ONNXRUNTIME_ARTIFACT_LIBRARY}")
+  endif()
+  set(TRITON_ONNXRUNTIME_INCLUDE_PATHS "${TRITON_ONNXRUNTIME_ARTIFACTS_PATH}/include")
+  set(TRITON_ONNXRUNTIME_LIB_PATHS "${TRITON_ONNXRUNTIME_ARTIFACTS_PATH}/lib")
+  set(TRITON_ONNXRUNTIME_INSTALL_PATH "${TRITON_ONNXRUNTIME_ARTIFACTS_PATH}")
+elseif(TRITON_ONNXRUNTIME_LIB_PATHS STREQUAL "")
   set(TRITON_ONNXRUNTIME_DOCKER_BUILD ON)
 endif()
 
@@ -432,10 +459,11 @@ install(
 # that tar file. We copy over the libraries and other requirements
 # prior to running this build and therefore these set of install
 # commands are not needed.
-if(TRITON_ONNXRUNTIME_DOCKER_BUILD OR DEFINED TRITON_ONNXRUNTIME_PACKAGE_URL)
+if(TRITON_ONNXRUNTIME_DOCKER_BUILD OR DEFINED TRITON_ONNXRUNTIME_PACKAGE_URL
+   OR NOT TRITON_ONNXRUNTIME_ARTIFACTS_PATH STREQUAL "")
   install(
     DIRECTORY
-      ${CMAKE_CURRENT_BINARY_DIR}/onnxruntime/
+      ${TRITON_ONNXRUNTIME_INSTALL_PATH}/
     DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/onnxruntime
     PATTERN *lib EXCLUDE
     PATTERN *bin EXCLUDE
@@ -445,7 +473,7 @@ if(TRITON_ONNXRUNTIME_DOCKER_BUILD OR DEFINED TRITON_ONNXRUNTIME_PACKAGE_URL)
 
   install(
     DIRECTORY
-      ${CMAKE_CURRENT_BINARY_DIR}/onnxruntime/bin/
+      ${TRITON_ONNXRUNTIME_INSTALL_PATH}/bin/
     USE_SOURCE_PERMISSIONS
     DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/onnxruntime
   )
@@ -453,14 +481,14 @@ if(TRITON_ONNXRUNTIME_DOCKER_BUILD OR DEFINED TRITON_ONNXRUNTIME_PACKAGE_URL)
   if (NOT WIN32)
     install(
       DIRECTORY
-        ${CMAKE_CURRENT_BINARY_DIR}/onnxruntime/lib/
+        ${TRITON_ONNXRUNTIME_INSTALL_PATH}/lib/
       USE_SOURCE_PERMISSIONS
       DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/onnxruntime
     )
 
     install(
       DIRECTORY
-        ${CMAKE_CURRENT_BINARY_DIR}/onnxruntime/test
+        ${TRITON_ONNXRUNTIME_INSTALL_PATH}/test
       USE_SOURCE_PERMISSIONS
       DESTINATION ${CMAKE_INSTALL_PREFIX}
     )
