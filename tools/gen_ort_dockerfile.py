@@ -28,9 +28,12 @@
 import argparse
 import os
 import platform
-import re
 
 FLAGS = None
+
+# Temporary Jenkins WIP for ORT 1.26 on the Triton 26.03 CUDA image.
+ORT_BUILD_GCC_VERSION = "14"
+PATCH_CUDA_CCCL_PROCLAIMS_COPYABLE_ARGUMENTS = True
 
 OPENVINO_VERSION_MAP = {
     "2024.0.0": (
@@ -76,14 +79,6 @@ OPENVINO_VERSION_MAP = {
     "2026.0.0": (
         "2026.0",  # OpenVINO short version
         "2026.0.0.20965.c6d6a13a886",  # OpenVINO version with build number
-    ),
-    "2026.1.0": (
-        "2026.1",  # OpenVINO short version
-        "2026.1.0.21367.63e31528c62",  # OpenVINO version with build number
-    ),
-    "2026.2.0": (
-        "2026.2",  # OpenVINO short version
-        "2026.2.0.21903.52ddc073857",  # OpenVINO version with build number
     ),
 }
 
@@ -153,6 +148,80 @@ FROM ${BASE_IMAGE}
 WORKDIR /workspace
 """
     return df
+
+
+def selected_gcc_paths():
+    if target_platform() == "rhel":
+        compiler_root = "/opt/rh/gcc-toolset-{}/root/usr/bin".format(
+            ORT_BUILD_GCC_VERSION
+        )
+        return "{}/gcc".format(compiler_root), "{}/g++".format(compiler_root)
+    return "/usr/bin/gcc-{}".format(ORT_BUILD_GCC_VERSION), "/usr/bin/g++-{}".format(
+        ORT_BUILD_GCC_VERSION
+    )
+
+
+def dockerfile_install_psutil():
+    return """
+RUN pip3 install psutil
+"""
+
+
+def dockerfile_install_gcc():
+    cc, cxx = selected_gcc_paths()
+    if target_platform() == "rhel":
+        return """
+RUN dnf install -y \\
+        gcc-toolset-{0}-gcc \\
+        gcc-toolset-{0}-gcc-c++
+
+ENV PATH=/opt/rh/gcc-toolset-{0}/root/usr/bin:$PATH \\
+    CC={1} \\
+    CXX={2} \\
+    CUDAHOSTCXX={2}
+""".format(
+            ORT_BUILD_GCC_VERSION, cc, cxx
+        )
+
+    return """
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+        gcc-{0} \\
+        g++-{0} \\
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CC={1} \\
+    CXX={2} \\
+    CUDAHOSTCXX={2}
+""".format(
+        ORT_BUILD_GCC_VERSION, cc, cxx
+    )
+
+
+def dockerfile_patch_cuda_cccl():
+    if not PATCH_CUDA_CCCL_PROCLAIMS_COPYABLE_ARGUMENTS:
+        return ""
+
+    return r"""
+# CUDA CCCL in some CUDA images contains a globally-qualified specialization
+# that GCC rejects. Patch only the exact affected device_transform.cuh pattern.
+RUN if [ -d /usr/local/cuda ]; then \
+        find -L /usr/local/cuda -path '*/cccl/cub/device/device_transform.cuh' -type f -print | while read -r CCCL_HEADER; do \
+            if grep -q 'struct ::cuda::proclaims_copyable_arguments' "$CCCL_HEADER"; then \
+                echo "Patching CCCL device_transform.cuh: $CCCL_HEADER"; \
+                python3 -c 'import pathlib, re, sys; p=pathlib.Path(sys.argv[1]); src=p.read_text(); pattern=re.compile(r"(template <(?:class|typename) T>\n)struct ::cuda::proclaims_copyable_arguments(<CUB_NS_QUALIFIER::detail::__return_constant<T>> : ::cuda::std::true_type\n\{\};)"); patched,n=pattern.subn(lambda m: "namespace cuda {\n" + m.group(1) + "struct proclaims_copyable_arguments" + m.group(2) + "\n} // namespace cuda", src, count=1); sys.exit("Exact CCCL specialization pattern not found") if n == 0 else p.write_text(patched); print("Patched successfully")' "$CCCL_HEADER" || exit $?; \
+            fi; \
+        done; \
+    fi
+"""
+
+
+def compiler_cmake_extra_defines():
+    cc, cxx = selected_gcc_paths()
+    return (
+        " --cmake_extra_defines CMAKE_C_COMPILER={}"
+        " --cmake_extra_defines CMAKE_CXX_COMPILER={}"
+        " --cmake_extra_defines CMAKE_CUDA_HOST_COMPILER={}"
+    ).format(cc, cxx, cxx)
 
 
 def dockerfile_for_linux(output_file):
@@ -255,6 +324,10 @@ RUN pip3 install \\
 ENV VERBOSE=1
 """
 
+    df += dockerfile_install_psutil()
+    df += dockerfile_install_gcc()
+    df += dockerfile_patch_cuda_cccl()
+
     if FLAGS.ort_openvino is not None:
         df += """
 # Install OpenVINO
@@ -350,10 +423,6 @@ ARG ONNXRUNTIME_REPO
 ARG ONNXRUNTIME_BUILD_CONFIG
 
 RUN git clone -b rel-${ONNXRUNTIME_VERSION} --recursive ${ONNXRUNTIME_REPO} onnxruntime && \\
-    ( cd onnxruntime && git checkout v${ONNXRUNTIME_VERSION} && \\
-    git config --global user.email "onnxruntime_backend@nvidia.com" && \\
-    git config --global user.name "onnxruntime_backend" && \\
-    git cherry-pick 53fcead6c747330dd69ac6b960972b535042b3ff ) && \\
     cd onnxruntime && git submodule update --init --recursive
         """
 
@@ -408,10 +477,11 @@ RUN git clone -b rel-${ONNXRUNTIME_VERSION} --recursive ${ONNXRUNTIME_REPO} onnx
     df += """
 WORKDIR /workspace/onnxruntime
 ARG COMMON_BUILD_ARGS="--config ${{ONNXRUNTIME_BUILD_CONFIG}} {} --skip_submodule_sync --build_shared_lib \
-    --compile_no_warning_as_error --build_dir /workspace/build --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES='{}'  --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5 --build_wheel"
+    --compile_no_warning_as_error --build_dir /workspace/build --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES='{}'{} --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5 --build_wheel"
 """.format(
         parallel_arg,
-        cuda_archs
+        cuda_archs,
+        compiler_cmake_extra_defines(),
     )
 
     df += """
@@ -517,9 +587,6 @@ RUN mkdir -p /opt/onnxruntime/test && \
        /opt/onnxruntime/test && \
     cp /workspace/build/${ONNXRUNTIME_BUILD_CONFIG}/testdata/custom_op_library/custom_op_test.onnx \
        /opt/onnxruntime/test
-"""
-    df += """
-CMD ["/bin/bash"]
 """
 
     with open(output_file, "w") as dfile:
@@ -636,5 +703,11 @@ if __name__ == "__main__":
     print(f"[INFO] Print stored values used for {FLAGS.output} generation")
     for name, value in sorted(vars(FLAGS).items()):
         print("  {}: {}".format(name, value))
+    print("  ort_build_gcc_version: {}".format(ORT_BUILD_GCC_VERSION))
+    print(
+        "  patch_cuda_cccl_proclaims_copyable_arguments: {}".format(
+            PATCH_CUDA_CCCL_PROCLAIMS_COPYABLE_ARGUMENTS
+        )
+    )
 
     dockerfile_for_linux(FLAGS.output)
