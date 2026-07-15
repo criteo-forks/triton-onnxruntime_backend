@@ -1266,8 +1266,9 @@ class ModelInstanceState : public BackendModelInstance {
     std::vector<int64_t> bound_shape;  // shape 'value' was created with
     bool is_scalar = false;            // model tensor has empty dims
     bool static_shape = false;         // fully static modulo the batch dim
-    TRITONSERVER_MemoryType mem_type;  // frozen at first allocation
-    int64_t mem_type_id;
+    TRITONSERVER_MemoryType mem_type =
+        TRITONSERVER_MEMORY_CPU;  // frozen at first allocation
+    int64_t mem_type_id = 0;
   };
 
   ModelInstanceState(
@@ -1725,18 +1726,23 @@ ModelInstanceState::EnsurePooledCapacity(
     alloc_types = {BackendMemory::AllocationType::CPU};
   }
 
+  // A dynamic dimension can resolve to 0 elements at run time; allocate at
+  // least one byte so the pooled buffer (and the OrtValue view over it)
+  // always has a valid data pointer.
+  const size_t alloc_bytes = std::max<size_t>(bytes, 1);
   BackendMemory* memory = nullptr;
   RETURN_IF_ERROR(BackendMemory::Create(
-      model_state_->TritonMemoryManager(), alloc_types, memory_type_id, bytes,
-      &memory));
+      model_state_->TritonMemoryManager(), alloc_types, memory_type_id,
+      alloc_bytes, &memory));
   pt->memory = memory;
   pt->mem_type = memory->MemoryType();
   pt->mem_type_id = memory->MemoryTypeId();
 
   LOG_MESSAGE(
-      TRITONSERVER_LOG_INFO,
+      TRITONSERVER_LOG_VERBOSE,
       (std::string("io_pooling: grew buffer '") + name + "' from " +
-       std::to_string(old_bytes) + " to " + std::to_string(bytes) + " bytes")
+       std::to_string(old_bytes) + " to " + std::to_string(alloc_bytes) +
+       " bytes")
           .c_str());
 
   return nullptr;  // success
@@ -2374,14 +2380,17 @@ ModelInstanceState::ProcessRequests(
             EnsurePooledCapacity(
                 &pt, output_name.first, byte_size, desired_placement));
 
-        if (!all_response_failed) {
-          // Freeze the derived placement (now known via the actual buffer) so
-          // ReadOutputTensors knows where the pooled output lives.
-          if (first_batch) {
-            output_device_info_[output_name.first] = {
-                pt.mem_type, pt.mem_type_id};
-          }
+        // Record the derived placement (now known via the actual buffer) so
+        // ReadOutputTensors knows where the pooled output lives. Done
+        // whenever the buffer exists (idempotent), not only on the first
+        // batch: an unrelated failure in the same batch must not leave the
+        // buffer allocated but the device info unset for later batches.
+        if (pt.memory != nullptr) {
+          output_device_info_[output_name.first] = {
+              pt.mem_type, pt.mem_type_id};
+        }
 
+        if (!all_response_failed) {
           OrtValue* pooled_value = nullptr;
           RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
               responses, request_count, all_response_failed,
