@@ -285,6 +285,22 @@ for more information.
 See [this](https://github.com/microsoft/onnxruntime/blob/master/include/onnxruntime/core/session/onnxruntime_run_options_config_keys.h)
 for more information.
 * `session.use_device_allocator_for_initializers`: Use "1" to enable using device allocator for allocating initialized tensor memory and "0" to disable. The default is "0". See [this](https://onnxruntime.ai/docs/get-started/with-c.html) for more information.
+* `io_pooling`: Boolean, default `true`. When enabled, non-string inputs and
+static-shape (modulo the batch dimension) non-string outputs use per-instance
+pooled buffers that are reused across batches. This eliminates per-batch buffer
+allocations and keeps the I/O device addresses stable across batches. Buffers
+for tensors with fully static shapes are pre-allocated at model load to their
+maximum batch size; tensors with dynamic dimensions use grow-only buffers sized
+on demand (growth events are logged at INFO level, and buffers are never shrunk).
+Pooling always copies request data into the pooled buffer, which disables the
+zero-copy path used when a batch consists of a single contiguous request; set
+`io_pooling` to `false` for CPU workloads dominated by single-request batches if
+that matters. Dynamic-shape outputs, string tensors and batch inputs/outputs are
+unaffected and keep the legacy path.
+
+```
+parameters { key: "io_pooling" value: { string_value: "true" } }
+```
 
 ### Command line options
 
