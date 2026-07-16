@@ -2375,10 +2375,19 @@ ModelInstanceState::ProcessRequests(
         const TRITONSERVER_DataType dtype = ConvertFromOnnxDataType(info.type_);
         const size_t byte_size = GetByteSize(dtype, shape);
 
+        // Pre-size the buffer to the maximum batch size (like pooled inputs)
+        // so it is allocated once and the output device address is stable
+        // from the first batch onwards.
+        std::vector<int64_t> max_shape = shape;
+        if ((model_state_->MaxBatchSize() > 0) && !max_shape.empty()) {
+          max_shape[0] = model_state_->MaxBatchSize();
+        }
+        const size_t max_byte_size = GetByteSize(dtype, max_shape);
+
         RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
             responses, request_count, all_response_failed,
             EnsurePooledCapacity(
-                &pt, output_name.first, byte_size, desired_placement));
+                &pt, output_name.first, max_byte_size, desired_placement));
 
         // Record the derived placement (now known via the actual buffer) so
         // ReadOutputTensors knows where the pooled output lives. Done
