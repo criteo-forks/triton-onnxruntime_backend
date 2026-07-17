@@ -296,7 +296,11 @@ Pooling always copies request data into the pooled buffer, which disables the
 zero-copy path used when a batch consists of a single contiguous request; set
 `io_pooling` to `false` for CPU workloads dominated by single-request batches if
 that matters. Dynamic-shape outputs, string tensors and batch inputs/outputs are
-unaffected and keep the legacy path.
+unaffected and keep the legacy path. On GPU instances, pooled buffers that live
+on the host (e.g. a CPU-placed output that ORT copies device-to-host at the end
+of each run) are allocated from page-locked (pinned) memory — the pinned pool
+first, falling back to a direct pinned allocation and then to pageable memory —
+so those transfers use DMA instead of a synchronous staged copy.
 
 ```
 parameters { key: "io_pooling" value: { string_value: "true" } }

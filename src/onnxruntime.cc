@@ -1722,6 +1722,20 @@ ModelInstanceState::EnsurePooledCapacity(
         BackendMemory::AllocationType::GPU_POOL,
         BackendMemory::AllocationType::GPU};
     memory_type_id = DeviceId();
+  } else if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    // A host-placed pooled buffer on a GPU instance participates in a
+    // per-run device<->host transfer (e.g. ORT's D2H of a CPU-bound output
+    // at the end of RunWithBinding). Back it with page-locked (pinned) host
+    // memory so that transfer is a direct DMA instead of a synchronous copy
+    // staged through a driver-internal bounce buffer. Draw from the
+    // pre-allocated pinned pool first (no per-allocation cudaHostAlloc), then
+    // a direct pinned allocation, then pageable host memory as a last resort
+    // (e.g. no pinned pool configured). The buffer is allocated once at load
+    // (or grows rarely), so the pinned footprint is bounded and stable.
+    alloc_types = {
+        BackendMemory::AllocationType::CPU_PINNED_POOL,
+        BackendMemory::AllocationType::CPU_PINNED,
+        BackendMemory::AllocationType::CPU};
   } else {
     alloc_types = {BackendMemory::AllocationType::CPU};
   }
