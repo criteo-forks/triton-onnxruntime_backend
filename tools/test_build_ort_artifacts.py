@@ -105,6 +105,24 @@ class BuildOrtArtifactsTest(unittest.TestCase):
             )
             self.assertIn("-DTRITON_ONNXRUNTIME_BUILD_AS_ROOT:BOOL=OFF", cmake_args)
 
+            # Cache identity must be content-based, not branch-tag-based: the
+            # backend ref name (backend_tag) must not be in the hashed identity,
+            # and the ORT-build-driving source hash must be.
+            identity = plan["ort_identity"]
+            self.assertNotIn("backend_tag", identity)
+            self.assertIn("ort_build_source", identity)
+            self.assertTrue(identity["ort_build_source"])
+
+            # EP-specific values are gated on the EP toggle. TRT EP defaults ON
+            # with --enable-gpu, so trt_version is present (empty = use the
+            # parser version shipping with ORT). OpenVINO is OFF here, so its
+            # version must be absent.
+            self.assertIn("trt_version", identity)
+            self.assertEqual(identity["trt_version"], "")
+            self.assertIn("onnx_tensorrt_repo_tag", identity)
+            self.assertEqual(identity["onnx_tensorrt_repo_tag"], "")
+            self.assertNotIn("ort_openvino_version", identity)
+
     def test_full_build_reuses_matching_artifact_only(self):
         if not SERVER_DIR.exists():
             self.skipTest("triton-server checkout not found at {}".format(SERVER_DIR))

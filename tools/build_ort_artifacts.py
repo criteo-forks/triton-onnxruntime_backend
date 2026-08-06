@@ -254,15 +254,25 @@ def config_hash(config):
     return hashlib.sha256(payload).hexdigest()[:12]
 
 
+def _cmake_arg_value(cmake_args, name):
+    """Return the value of a -D<name>[:TYPE]=<value> cmake arg, or "" if absent."""
+    for arg in cmake_args:
+        if arg.startswith("-D"):
+            key = arg[2:].split("=", 1)[0]
+            arg_name = key.split(":")[0]
+            if arg_name == name:
+                return arg[2:].split("=", 1)[1] if "=" in arg[2:] else ""
+    return ""
+
+
 def _ort_identity_cmake_args(cmake_args):
     """Extract cmake args that affect the ORT binary identity.
 
     Only cmake variables that reach gen_ort_dockerfile.py via
     CMakeLists.txt:403/416 (either directly or through _GEN_FLAGS) are
-    included.  Triton-generic variables (STATS, METRICS, repo tags, etc.)
-    and environment-only variables (TRT_VERSION,
-    TRITON_ONNX_TENSORRT_REPO_TAG) are excluded so that non-ORT build
-    changes do not invalidate the ORT artifact cache.
+    included. Triton-generic variables (STATS, METRICS, repo tags, etc.)
+    are excluded so that non-ORT build changes do not invalidate the ORT
+    artifact cache.
     """
     ort_keys = {
         "TRITON_BUILD_CONTAINER",
@@ -276,6 +286,51 @@ def _ort_identity_cmake_args(cmake_args):
             if name in ort_keys:
                 result.append(arg)
     return sorted(result)
+
+
+def _ort_ep_identity(cmake_args, ort_openvino_version):
+    """Execution-provider-specific values, included only when the EP is ON.
+
+    TRT_VERSION and TRITON_ONNX_TENSORRT_REPO_TAG are read from the resolved
+    cmake args (the same args CMakeLists.txt forwards to gen_ort_dockerfile.py
+    as --trt-version / --onnx-tensorrt-tag; they default to "" when unset, which
+    means "use the parser version that ships with the ORT release"). They change
+    the onnx-tensorrt parser built into ORT, so they must be in the identity when
+    the TensorRT EP is enabled. OpenVINO version likewise matters only when the
+    OpenVINO EP is enabled. Gating on the EP toggle avoids false misses from
+    unset/irrelevant values and false positives from ignoring them when set.
+    """
+    ep = {}
+    if _cmake_arg_value(cmake_args, "TRITON_ENABLE_ONNXRUNTIME_TENSORRT") == "ON":
+        ep["trt_version"] = _cmake_arg_value(cmake_args, "TRT_VERSION")
+        ep["onnx_tensorrt_repo_tag"] = _cmake_arg_value(
+            cmake_args, "TRITON_ONNX_TENSORRT_REPO_TAG"
+        )
+    if _cmake_arg_value(cmake_args, "TRITON_ENABLE_ONNXRUNTIME_OPENVINO") == "ON":
+        ep["ort_openvino_version"] = ort_openvino_version
+    return ep
+
+
+def ort_build_source_hash():
+    """Content hash of the backend source that drives the ORT docker build.
+
+    The ORT artifact is built by tools/gen_ort_dockerfile.py, which emits
+    Dockerfile.ort; the docker build clones ONNX Runtime from upstream and COPYs
+    nothing from the backend source. The ort_target custom command in
+    CMakeLists.txt only invokes `docker build` + `docker cp /opt/onnxruntime`
+    (no selective copy, no content alteration), so it does not affect the ORT
+    binary beyond what gen_ort_dockerfile.py + the resolved build flags already
+    determine. Hashing gen_ort_dockerfile.py alone (rather than the backend
+    branch tag, the whole backend tree, or the whole CMakeLists.txt) gives a
+    scoped identity: no false positives when the ORT Dockerfile generator
+    changes, no false misses when unrelated backend CMake/source changes, and
+    stable across the pipeline's re-cherry-picks (content-based, not
+    commit-based).
+    """
+    h = hashlib.sha256()
+    path = BACKEND_DIR / "tools" / "gen_ort_dockerfile.py"
+    h.update(path.read_bytes())
+    return h.hexdigest()[:12]
 
 
 def docker_mount_args(paths):
@@ -459,7 +514,6 @@ def resolve_and_build(wrapper_args):
         "version": build.FLAGS.version,
     }
     ort_identity = {
-        "backend_tag": backend_tag,
         "build_environment": (
             "triton-build-container"
             if wrapper_args.build_in_triton_build_container
@@ -468,14 +522,17 @@ def resolve_and_build(wrapper_args):
         "build_type": build.FLAGS.build_type,
         "cuda_arch_list": cuda_arch_list,
         "enable_gpu": build.FLAGS.enable_gpu,
+        "ort_build_source": ort_build_source_hash(),
         "ort_cmake_args": _ort_identity_cmake_args(cmake_args),
-        "ort_openvino_version": build.FLAGS.ort_openvino_version,
         "ort_version": build.FLAGS.ort_version,
         "target_machine": build.target_machine(),
         "target_platform": build.target_platform(),
         "triton_buildbase_image": wrapper_args.triton_buildbase_image,
         "triton_container_version": build.FLAGS.triton_container_version,
     }
+    ort_identity.update(
+        _ort_ep_identity(cmake_args, build.FLAGS.ort_openvino_version)
+    )
     config_hash_value = config_hash(ort_identity)
     source_config["config_hash"] = config_hash_value
 
@@ -487,11 +544,12 @@ def resolve_and_build(wrapper_args):
             config_hash_value,
         ),
         "backend_source_dir": str(BACKEND_DIR),
-        # Hash the tree (content), not the commit: the pipeline re-cherry-picks
-        # the overlay branch onto the build branch on every run, which yields a
-        # fresh commit SHA for identical content and would invalidate the
-        # cached ORT artifact each time (both locally and on Jenkins, where
-        # only the docker layer cache hid the churn).
+        # Recorded for traceability only (not part of the cache identity).
+        # Tree hash, not commit SHA, so it is stable across the pipeline's
+        # re-cherry-picks of the overlay branch. The cache identity uses
+        # ort_build_source (a content hash of the ORT-build-driving files)
+        # instead of this, so unrelated backend wrapper source changes do not
+        # invalidate the ORT artifact cache.
         "backend_git_commit": git_value(
             BACKEND_DIR, ["rev-parse", "HEAD^{tree}"]
         ),
