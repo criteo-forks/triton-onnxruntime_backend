@@ -352,6 +352,17 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
             (std::string("Configuring enable_mem_arena to ") + string_value)
                 .c_str());
         THROW_IF_BACKEND_MODEL_ORT_ERROR(ort_status);
+      } else {
+        // Default: disable CPU memory arena to prevent RSS growth across
+        // load/unload cycles. The BFCArena retains freed memory in per-session
+        // pools and does not return it to the OS, causing monotonic RSS growth.
+        // With arena disabled, allocations go directly to the system allocator
+        // which returns memory on free.
+        LOG_MESSAGE(
+            TRITONSERVER_LOG_VERBOSE,
+            "Disabling CPU memory arena by default to prevent memory leak");
+        THROW_IF_BACKEND_MODEL_ORT_ERROR(
+            ort_api->DisableCpuMemArena(soptions));
       }
     }
   }
@@ -1403,6 +1414,42 @@ ModelInstanceState::ModelInstanceState(
       THROW_IF_BACKEND_MODEL_ORT_ERROR(ort_api->AddRunConfigEntry(
           runOptions_, enable_memory_arena_shrinkage_key,
           string_value.c_str()));
+    } else {
+      // Default: enable memory arena shrinkage to prevent memory leak across
+      // load/unload cycles. Without this, arenas grow monotonically and never
+      // return memory to the OS/driver, causing RSS/GPU memory to grow until OOM.
+      // See: onnxruntime/core/framework/bfc_arena.cc Shrink()
+      //       onnxruntime/core/providers/cuda/cuda_mempool_arena.cc Shrink()
+      //
+      // Build the shrink list based on what arenas are enabled:
+      // - GPU arena is always enabled for GPU models (CudaMempoolArena)
+      // - CPU arena is only included if not explicitly disabled
+      bool cpu_arena_enabled = true;  // ORT default
+      triton::common::TritonJson::Value arena_param;
+      if (params.Find("enable_mem_arena", &arena_param)) {
+        std::string arena_val;
+        auto err = arena_param.MemberAsString("string_value", &arena_val);
+        if (err == nullptr) {
+          ParseBoolValue(arena_val, &cpu_arena_enabled);
+        }
+      }
+
+      // GPU arena shrinkage triggers cudaMemPoolTrimTo, returning freed GPU
+      // memory to the CUDA driver. This is critical for preventing GPU OOM
+      // across model load/unload cycles in Triton.
+      std::string shrink_list = "gpu:0";
+      if (cpu_arena_enabled) {
+        shrink_list += ";cpu:0";
+      }
+
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_VERBOSE,
+          (std::string("Configuring memory.enable_memory_arena_shrinkage to ") +
+           shrink_list + " (default)")
+              .c_str());
+      THROW_IF_BACKEND_MODEL_ORT_ERROR(ort_api->AddRunConfigEntry(
+          runOptions_, enable_memory_arena_shrinkage_key,
+          shrink_list.c_str()));
     }
   }
 
