@@ -1290,8 +1290,8 @@ class ModelInstanceState : public BackendModelInstance {
   // if necessary. Growing releases the cached OrtValue view over the old
   // buffer. No-op when the existing capacity is already sufficient.
   // 'desired_placement' selects the allocation device (GPU -> {GPU_POOL,GPU}
-  // on DeviceId(); anything else -> CPU) and is frozen on the first
-  // allocation.
+  // on DeviceId(); anything else -> CPU, or pinned host memory on a GPU
+  // instance) and is frozen on the first allocation.
   TRITONSERVER_Error* EnsurePooledCapacity(
       PooledTensor* pt, const std::string& name, size_t bytes,
       TRITONSERVER_MemoryType desired_placement);
@@ -1735,6 +1735,22 @@ ModelInstanceState::EnsurePooledCapacity(
         BackendMemory::AllocationType::GPU_POOL,
         BackendMemory::AllocationType::GPU};
     memory_type_id = DeviceId();
+  } else if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    // A host-placed pooled buffer on a GPU instance participates in a
+    // per-run device<->host transfer (e.g. ORT's D2H of a CPU-bound output
+    // at the end of RunWithBinding). Back it with page-locked (pinned) host
+    // memory so that transfer is a direct DMA instead of a synchronous copy
+    // staged through a driver-internal bounce buffer. Draw from the
+    // pre-allocated pinned pool first (no per-allocation cudaHostAlloc), then
+    // a direct pinned allocation, then pageable host memory as a last resort
+    // (e.g. no pinned pool configured). The buffer is allocated when it is
+    // first created (a pooled output: on the first batch, already at the max
+    // batch size) and only reallocated if it grows, so the pinned footprint
+    // is bounded and stable.
+    alloc_types = {
+        BackendMemory::AllocationType::CPU_PINNED_POOL,
+        BackendMemory::AllocationType::CPU_PINNED,
+        BackendMemory::AllocationType::CPU};
   } else {
     alloc_types = {BackendMemory::AllocationType::CPU};
   }
@@ -1755,7 +1771,8 @@ ModelInstanceState::EnsurePooledCapacity(
       TRITONSERVER_LOG_VERBOSE,
       (std::string("io_pooling: grew buffer '") + name + "' from " +
        std::to_string(old_bytes) + " to " + std::to_string(alloc_bytes) +
-       " bytes")
+       " bytes, allocated as " +
+       BackendMemory::AllocTypeString(memory->AllocType()))
           .c_str());
 
   return nullptr;  // success
