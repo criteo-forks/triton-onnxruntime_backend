@@ -2124,6 +2124,7 @@ ModelInstanceState::ProcessRequests(
                    output_name.first +
                    " Error: " + TRITONSERVER_ErrorMessage(err))
                    .c_str()));
+          TRITONSERVER_ErrorDelete(err);
           memory_type = TRITONSERVER_MEMORY_CPU;
           memory_type_id = 0;
         }
