@@ -311,7 +311,14 @@ batch size as its first dimension makes the inference fail: ORT 1.30 reports a
 clean `INVALID_ARGUMENT` error (earlier ORT versions fail an `ORT_ENFORCE`
 check), and the only workaround is `io_pooling` set to `false`. String tensors,
 outputs with dynamic dimensions and batch inputs/outputs are unaffected and keep
-the legacy path.
+the legacy path. On GPU instances, a pooled output that lives on the host (e.g.
+a CPU-placed output that ORT copies device-to-host at the end of each run) is
+allocated from page-locked (pinned) memory when it is created, on the first
+batch: from the pinned memory pool first (`--pinned-memory-pool-byte-size`, 256
+MB by default, shared server-wide and held by each instance for its lifetime),
+then, once the pool is exhausted, from a direct pinned allocation and finally
+from pageable memory, so those transfers use DMA instead of a synchronous staged
+copy. The memory type obtained for each buffer is logged at VERBOSE level.
 
 ```
 parameters { key: "io_pooling" value: { string_value: "true" } }
