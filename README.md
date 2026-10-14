@@ -285,6 +285,28 @@ for more information.
 See [this](https://github.com/microsoft/onnxruntime/blob/master/include/onnxruntime/core/session/onnxruntime_run_options_config_keys.h)
 for more information.
 * `session.use_device_allocator_for_initializers`: Use "1" to enable using device allocator for allocating initialized tensor memory and "0" to disable. The default is "0". See [this](https://onnxruntime.ai/docs/get-started/with-c.html) for more information.
+* `io_pooling`: Boolean (`true`/`on`/`1` or `false`/`off`/`0`, any other value
+makes the model fail to load), default `true`. When enabled, non-string inputs
+use per-instance pooled buffers that are reused across batches. This eliminates
+per-batch input buffer allocations and keeps the input device addresses stable
+across batches. The buffers are permanent: they are grow-only and held for the
+lifetime of the model instance. Inputs whose non-batch dimensions are all
+static are allocated at model load, sized for `max_batch_size`; inputs with
+dynamic dimensions get a buffer on first use that is grown on demand (growth
+events are logged at INFO level). The memory held per instance is therefore the
+sum, over the statically-shaped inputs, of
+`max_batch_size * product(non-batch dims) * sizeof(type)` (`max_batch_size`
+counts as 1 for models without batching); for example 36.8 MiB for each fp32
+`[3, 224, 224]` input with `max_batch_size` 64.
+Pooling always copies request data into the pooled buffer, which disables the
+zero-copy path used when a batch consists of a single contiguous request, so
+CPU instances dominated by single-request batches lose that fast path; set
+`io_pooling` to `false` to restore it. String inputs and batch inputs are
+unaffected and keep the legacy path.
+
+```
+parameters { key: "io_pooling" value: { string_value: "true" } }
+```
 
 ### Command line options
 
