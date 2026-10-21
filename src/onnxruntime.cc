@@ -60,6 +60,23 @@ struct ValueDeleter {
   void operator()(OrtValue* f) { ort_api->ReleaseValue(f); }
 };
 
+// Byte size of a tensor for buffer sizing purposes. GetByteSize() cannot be
+// used for a rank-0 tensor: it derives the element count from the shape, and
+// GetElementCount() returns its zero-initialised accumulator for an empty shape
+// (backend_common.cc), so a scalar reports 0 bytes instead of one element. A
+// pooled buffer sized at 0 falls back to the 1-byte floor in
+// EnsurePooledCapacity, and the OrtValue then created over it is rejected by
+// ORT with "not enough space: expected 4, got 0" - which is how a rank-0
+// *output* (a scalar model, e.g. qa_scalar_models) fails every request while
+// io_pooling is on. Scalars occupy exactly one element.
+size_t
+BufferByteSize(
+    const TRITONSERVER_DataType dtype, const std::vector<int64_t>& shape)
+{
+  return shape.empty() ? TRITONSERVER_DataTypeByteSize(dtype)
+                       : GetByteSize(dtype, shape);
+}
+
 // BackendConfiguration
 struct BackendConfiguration {
   static const BackendConfiguration& RetrieveFrom(
@@ -2403,7 +2420,7 @@ ModelInstanceState::ProcessRequests(
           }
         }
         const TRITONSERVER_DataType dtype = ConvertFromOnnxDataType(info.type_);
-        const size_t byte_size = GetByteSize(dtype, shape);
+        const size_t byte_size = BufferByteSize(dtype, shape);
 
         // Pre-size the buffer to the maximum batch size (like pooled inputs)
         // so it is allocated once and the output device address is stable
@@ -2412,7 +2429,7 @@ ModelInstanceState::ProcessRequests(
         if ((model_state_->MaxBatchSize() > 0) && !max_shape.empty()) {
           max_shape[0] = model_state_->MaxBatchSize();
         }
-        const size_t max_byte_size = GetByteSize(dtype, max_shape);
+        const size_t max_byte_size = BufferByteSize(dtype, max_shape);
 
         RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
             responses, request_count, all_response_failed,
@@ -2727,7 +2744,7 @@ ModelInstanceState::SetInputTensors(
       // 'input_tensors_' (ReleaseOrtRunResources must never release it).
       PooledTensor& pt = pooled_it->second;
 
-      size_t batchn_byte_size = GetByteSize(input_datatype, batchn_shape);
+      size_t batchn_byte_size = BufferByteSize(input_datatype, batchn_shape);
       RETURN_IF_ERROR(EnsurePooledCapacity(
           &pt, input_name, batchn_byte_size,
           Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU
