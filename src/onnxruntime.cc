@@ -119,6 +119,8 @@ class ModelState : public BackendModel {
     return model_outputs_;
   }
 
+  bool BindOutputsToCpu() const { return bind_outputs_to_cpu_; }
+
  private:
   ModelState(TRITONBACKEND_Model* triton_model);
   TRITONSERVER_Error* AutoCompleteConfig();
@@ -137,6 +139,8 @@ class ModelState : public BackendModel {
   // is specified both in the output section and state section, it indicates
   // that the backend must return the output state to the client too.
   std::map<std::string, std::pair<int64_t, int64_t>> model_outputs_;
+
+  bool bind_outputs_to_cpu_;
 };
 
 TRITONSERVER_Error*
@@ -207,7 +211,8 @@ ModelState::Create(TRITONBACKEND_Model* triton_model, ModelState** state)
 }
 
 ModelState::ModelState(TRITONBACKEND_Model* triton_model)
-    : BackendModel(triton_model, true /* allow_optional */)
+    : BackendModel(triton_model, true /* allow_optional */),
+      bind_outputs_to_cpu_(false)
 {
   // Create session options that will be cloned and used for each
   // instance when creating that instance's session.
@@ -382,6 +387,14 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
                 .c_str());
         THROW_IF_BACKEND_MODEL_ORT_ERROR(ort_status);
       }
+    }
+  }
+
+  {
+    triton::common::TritonJson::Value params;
+    if (ModelConfig().Find("parameters", &params)) {
+      THROW_IF_BACKEND_MODEL_ERROR(TryParseModelStringParameter(
+          params, "bind_outputs_to_cpu", &bind_outputs_to_cpu_, false));
     }
   }
 
@@ -2117,7 +2130,8 @@ ModelInstanceState::ProcessRequests(
       }
 
       // If the cuda allocator is not set, bind the output to CPU.
-      if (cuda_allocator_info_ == nullptr) {
+      if ((cuda_allocator_info_ == nullptr) ||
+          StateForModel()->BindOutputsToCpu()) {
         memory_type = TRITONSERVER_MEMORY_CPU;
         memory_type_id = 0;
       }
